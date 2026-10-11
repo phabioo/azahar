@@ -2,7 +2,10 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <algorithm>
+#include <bit>
 #include <list>
+#include <memory>
 #include <numeric>
 #include <vector>
 #include <math.h>
@@ -212,6 +215,8 @@ static void UpdateSettings() {
     Core::System::GetInstance().ApplySettings();
 }
 
+static void update_memory_maps();
+
 /**
  * libretro callback; Called every game tick.
  */
@@ -314,68 +319,145 @@ void retro_run() {
             LibRetro::DisplayMessage(msg.c_str());
         }
     }
+
+    // Games allocate heap and linear heap (svcControlMemory) after boot, so the memory map has to
+    // follow the VMA layout of the running process.
+    update_memory_maps();
 }
 
-static void setup_memory_maps() {
-    auto process = Core::System::GetInstance().Kernel().GetCurrentProcess();
-    if (!process)
-        return;
+/// A VMA exposed through RETRO_ENVIRONMENT_SET_MEMORY_MAPS. Also used as a cheap fingerprint of
+/// the memory layout to detect when the map has to be re-sent.
+struct MemoryMapEntry {
+    VAddr base;
+    u32 size;
+    const u8* ptr;
 
-    std::vector<retro_memory_descriptor> descs;
+    bool operator==(const MemoryMapEntry&) const = default;
+};
 
-    for (const auto& [addr, vma] : process->vm_manager.vma_map) {
+/// The application process whose memory is exposed. Applets and system processes are never
+/// exposed, even while they are the current process.
+static std::weak_ptr<Kernel::Process> memory_map_process;
+static u64 memory_map_program_id = 0;
+static std::vector<MemoryMapEntry> exposed_memory_map;
+
+/// Returns the descriptor flags for a VMA, or 0 if it is not a well-known user-accessible region.
+static uint64_t get_memory_map_flags(VAddr base) {
+    if (base >= Memory::HEAP_VADDR && base < Memory::HEAP_VADDR_END)
+        return RETRO_MEMDESC_SYSTEM_RAM;
+    if (base >= Memory::LINEAR_HEAP_VADDR && base < Memory::LINEAR_HEAP_VADDR_END)
+        return RETRO_MEMDESC_SYSTEM_RAM;
+    if (base >= Memory::NEW_LINEAR_HEAP_VADDR && base < Memory::NEW_LINEAR_HEAP_VADDR_END)
+        return RETRO_MEMDESC_SYSTEM_RAM;
+    if (base >= Memory::VRAM_VADDR && base < Memory::VRAM_VADDR_END)
+        return RETRO_MEMDESC_VIDEO_RAM;
+    return 0;
+}
+
+static void collect_memory_map(const Kernel::Process& process,
+                               std::vector<MemoryMapEntry>& entries) {
+    entries.clear();
+    for (const auto& [addr, vma] : process.vm_manager.vma_map) {
         if (vma.type != Kernel::VMAType::BackingMemory)
             continue;
         if (vma.size == 0 || !vma.backing_memory)
             continue;
-
-        // Only expose the well-known user-accessible memory regions
-        uint64_t flags = 0;
-        if (vma.base >= Memory::HEAP_VADDR && vma.base < Memory::HEAP_VADDR_END) {
-            flags = RETRO_MEMDESC_SYSTEM_RAM;
-        } else if (vma.base >= Memory::LINEAR_HEAP_VADDR &&
-                   vma.base < Memory::LINEAR_HEAP_VADDR_END) {
-            flags = RETRO_MEMDESC_SYSTEM_RAM;
-        } else if (vma.base >= Memory::NEW_LINEAR_HEAP_VADDR &&
-                   vma.base < Memory::NEW_LINEAR_HEAP_VADDR_END) {
-            flags = RETRO_MEMDESC_SYSTEM_RAM;
-        } else if (vma.base >= Memory::VRAM_VADDR && vma.base < Memory::VRAM_VADDR_END) {
-            flags = RETRO_MEMDESC_VIDEO_RAM;
-        } else {
+        if (get_memory_map_flags(vma.base) == 0)
             continue;
-        }
-
-        retro_memory_descriptor desc = {};
-        desc.flags = flags;
-        desc.ptr = const_cast<u8*>(vma.backing_memory.GetPtr());
-        desc.start = vma.base;
-        desc.len = vma.size;
-
-        // select=0 requires power-of-2 len AND start aligned to len.
-        // When that doesn't hold, compute a select mask instead.
-        bool need_select = (vma.size & (vma.size - 1)) != 0;
-        if (!need_select && (vma.base & (vma.size - 1)) != 0)
-            need_select = true;
-
-        if (need_select) {
-            uint64_t np2 = 1;
-            while (np2 < vma.size)
-                np2 <<= 1;
-            if (vma.base & (np2 - 1)) {
-                LOG_WARNING(Frontend, "VMA at 0x{:08X} size 0x{:X} not aligned, skipping", vma.base,
-                            vma.size);
-                continue;
-            }
-            desc.select = ~(np2 - 1);
-        }
-
-        descs.push_back(desc);
+        entries.push_back({vma.base, vma.size, vma.backing_memory.GetPtr()});
     }
+}
+
+/// Returns the application process, looked up by the program ID of the loaded game. The lookup is
+/// repeated when the cached process is gone (e.g. after loading a savestate).
+static std::shared_ptr<Kernel::Process> get_memory_map_process() {
+    if (auto process = memory_map_process.lock())
+        return process;
+
+    for (const auto& process : Core::System::GetInstance().Kernel().GetProcessList()) {
+        if (process && process->codeset && process->codeset->program_id == memory_map_program_id) {
+            memory_map_process = process;
+            return process;
+        }
+    }
+    return nullptr;
+}
+
+static void setup_memory_maps(const Kernel::Process& process) {
+    collect_memory_map(process, exposed_memory_map);
+
+    std::vector<retro_memory_descriptor> descs;
+
+    for (const auto& entry : exposed_memory_map) {
+        // Heap and linear heap VMAs are rarely a naturally aligned power of two. Split each VMA
+        // into the largest naturally aligned power-of-two chunks, so that every chunk can be
+        // described by a select mask and nothing is dropped.
+        VAddr addr = entry.base;
+        u32 remaining = entry.size;
+        while (remaining != 0) {
+            u32 chunk = std::bit_floor(remaining);
+            if (addr != 0)
+                chunk = std::min(chunk, addr & (~addr + 1));
+
+            retro_memory_descriptor desc = {};
+            desc.flags = get_memory_map_flags(entry.base);
+            // The backing memory (FCRAM / VRAM) is owned by the memory system and stays valid
+            // while the game is loaded.
+            desc.ptr = const_cast<u8*>(entry.ptr) + (addr - entry.base);
+            desc.start = addr;
+            desc.select = ~static_cast<size_t>(chunk - 1);
+            desc.len = chunk;
+            descs.push_back(desc);
+
+            addr += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    LOG_DEBUG(Frontend, "Exposing {} memory descriptors for {} VMAs of process {}", descs.size(),
+              exposed_memory_map.size(), process.process_id);
 
     if (!descs.empty()) {
         retro_memory_map map = {descs.data(), static_cast<unsigned>(descs.size())};
         LibRetro::SetMemoryMaps(&map);
     }
+}
+
+/// Re-sends the memory map when the exposed VMAs of the application process changed. If the
+/// process is gone, the last map is kept.
+static void update_memory_maps() {
+    auto process = get_memory_map_process();
+    if (!process)
+        return;
+
+    static std::vector<MemoryMapEntry> current;
+    collect_memory_map(*process, current);
+    if (current == exposed_memory_map)
+        return;
+
+    setup_memory_maps(*process);
+}
+
+/// Captures the application process of the game that was just loaded and sends its memory map.
+static void init_memory_maps(u64 program_id) {
+    memory_map_process.reset();
+    memory_map_program_id = program_id;
+    exposed_memory_map.clear();
+
+    auto process = get_memory_map_process();
+    if (!process) {
+        // Fall back to the process the loader made current.
+        process = Core::System::GetInstance().Kernel().GetCurrentProcess();
+        memory_map_process = process;
+    }
+    if (process)
+        setup_memory_maps(*process);
+}
+
+static void reset_memory_maps() {
+    memory_map_process.reset();
+    memory_map_program_id = 0;
+    exposed_memory_map.clear();
 }
 
 static bool do_load_game() {
@@ -423,7 +505,7 @@ static bool do_load_game() {
             false, nullptr);
     }
 
-    setup_memory_maps();
+    init_memory_maps(program_id);
 
     return true;
 }
@@ -502,6 +584,7 @@ static void context_destroy() {
 
 void retro_reset() {
     LOG_DEBUG(Frontend, "retro_reset");
+    reset_memory_maps();
     Core::System::GetInstance().Shutdown();
     emu_instance->game_loaded = do_load_game();
     emu_instance->first_run_loop = true;
@@ -644,6 +727,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 
 void retro_unload_game() {
     LOG_DEBUG(Frontend, "Unloading game...");
+    reset_memory_maps();
     Core::System::GetInstance().Shutdown();
 }
 
