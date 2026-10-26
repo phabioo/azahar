@@ -1,0 +1,117 @@
+# Builds the Uzume build of the libretro core (upstream Azahar plus the patches listed in UZUME.md) for the
+# platforms an Uzume server serves, and publishes it as a GitHub release in the layout of
+# `uzume-server import-cores`.
+name: uzume-core
+
+on:
+  push:
+    branches: [ "uzume", "claude/project-thread-detjbm" ]
+  workflow_dispatch:
+
+env:
+  CORE_ARGS: -DENABLE_LIBRETRO=ON
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uzume-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-22.04
+    env:
+      BUILD_DIR: build/linux-x86_64
+      EXTRA_CORE_ARGS: -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 -DENABLE_LTO=OFF
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y llvm
+      - name: Build
+        run: |
+          cmake $CORE_ARGS $EXTRA_CORE_ARGS . -B $BUILD_DIR
+          cmake --build $BUILD_DIR --target citra_libretro --config Release -j $(nproc)
+          llvm-strip -s $BUILD_DIR/bin/Release/azahar_libretro.so
+          mkdir -p out && cp $BUILD_DIR/bin/Release/azahar_libretro.so out/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x64
+          path: out/azahar_libretro.so
+
+  windows-x64:
+    runs-on: ubuntu-latest
+    env:
+      BUILD_DIR: build/windows-x86_64
+      EXTRA_CORE_ARGS: -DENABLE_LTO=OFF -G Ninja
+      CMAKE: x86_64-w64-mingw32.static-cmake
+      IMAGE: reallibretroretroarch/libretro-build-mxe-win-cross-cores:mingw12
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Build in cross-container
+        run: |
+          docker pull $IMAGE
+          docker run --rm --user root \
+              -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
+              -w "${GITHUB_WORKSPACE}" \
+              $IMAGE \
+              bash -lc "\
+                  ${CMAKE} $CORE_ARGS $EXTRA_CORE_ARGS . -B $BUILD_DIR && \
+                  ${CMAKE} --build $BUILD_DIR --target citra_libretro --config Release -j $(nproc) && \
+                  x86_64-w64-mingw32.static-strip -s $BUILD_DIR/bin/Release/azahar_libretro.dll"
+          mkdir -p out && cp $BUILD_DIR/bin/Release/azahar_libretro.dll out/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: out/azahar_libretro.dll
+
+  release:
+    needs: [ linux-x64, windows-x64 ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          path: libs
+      - name: Pack in the import-cores layout
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          SHORT=$(git rev-parse --short=8 HEAD)
+          TAG="uzume-core-${DATE}-${SHORT}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          mkdir -p import
+          for entry in "windows-x64 dll" "linux-x64 so"; do
+              set -- $entry
+              mkdir -p import/$1
+              (cd libs/$1 && zip -9 -X ../../import/$1/azahar_libretro.$2.zip azahar_libretro.$2)
+              CRC=$(python3 -c "import sys,zlib; print('%08x' % (zlib.crc32(open(sys.argv[1],'rb').read()) & 0xffffffff))" libs/$1/azahar_libretro.$2)
+              echo "$DATE $CRC azahar_libretro.$2.zip" > import/$1/.index-extended
+              cp import/$1/azahar_libretro.$2.zip azahar_libretro-$1.$2.zip
+          done
+          (cd import && zip -9 -X -r ../azahar-uzume-import.zip .)
+          sha256sum azahar-uzume-import.zip azahar_libretro-*.zip > SHA256SUMS.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Azahar libretro core for Uzume, built from \`${GITHUB_SHA}\` (branch \`${GITHUB_REF_NAME}\`)."
+            echo
+            echo "Upstream Azahar plus the patches listed in [UZUME.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/UZUME.md). Not an official Azahar build."
+            echo
+            echo "- \`azahar-uzume-import.zip\`: unzip it and run \`uzume-server import-cores <dir>\` on the server."
+            echo "- \`azahar_libretro-windows-x64.dll.zip\`, \`azahar_libretro-linux-x64.so.zip\`: the single cores."
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "Azahar for Uzume ${TAG#uzume-core-}" \
+              --notes-file notes.md --latest \
+              azahar-uzume-import.zip azahar_libretro-windows-x64.dll.zip azahar_libretro-linux-x64.so.zip SHA256SUMS.txt

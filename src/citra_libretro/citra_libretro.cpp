@@ -4,9 +4,12 @@
 
 #include <algorithm>
 #include <bit>
+#include <cctype>
 #include <list>
+#include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <vector>
 #include <math.h>
 #include <stdint.h>
@@ -45,6 +48,8 @@
 #include "common/logging/filter.h"
 #include "common/settings.h"
 #include "common/string_util.h"
+#include "core/cheats/cheats.h"
+#include "core/cheats/gateway_cheat.h"
 #include "core/core.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
@@ -216,6 +221,7 @@ static void UpdateSettings() {
 }
 
 static void update_memory_maps();
+static void add_libretro_cheats();
 
 /**
  * libretro callback; Called every game tick.
@@ -506,6 +512,7 @@ static bool do_load_game() {
     }
 
     init_memory_maps(program_id);
+    add_libretro_cheats();
 
     return true;
 }
@@ -727,6 +734,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 
 void retro_unload_game() {
     LOG_DEBUG(Frontend, "Unloading game...");
+    retro_cheat_reset();
     reset_memory_maps();
     Core::System::GetInstance().Shutdown();
 }
@@ -841,6 +849,95 @@ size_t retro_get_memory_size(unsigned id) {
     return 0;
 }
 
-void retro_cheat_reset() {}
+/// Cheats set by the frontend, by libretro cheat index. They are added to the cheat engine next to
+/// the cheats loaded from the cheats folder and removed again on reset or unload.
+static std::map<unsigned, std::shared_ptr<Cheats::CheatBase>> libretro_cheats;
 
-void retro_cheat_set(unsigned index, bool enabled, const char* code) {}
+/// Returns the position of a cheat in the cheat engine's list, or std::nullopt if it is not there.
+static std::optional<std::size_t> find_cheat(const std::shared_ptr<Cheats::CheatBase>& cheat) {
+    const auto cheats = Core::System::GetInstance().CheatEngine().GetCheats();
+    const auto it = std::find(cheats.begin(), cheats.end(), cheat);
+    if (it == cheats.end())
+        return std::nullopt;
+    return static_cast<std::size_t>(it - cheats.begin());
+}
+
+/// Converts a frontend cheat code to Gateway lines ("XXXXXXXX YYYYYYYY", one per line). Frontends
+/// separate lines with '+', newlines or spaces, and some write a line as one 16-digit token.
+static std::string to_gateway_code(const char* code) {
+    std::vector<std::string> words;
+    std::string word;
+    for (const char* c = code; *c != '\0'; ++c) {
+        if (std::isxdigit(static_cast<unsigned char>(*c))) {
+            word += *c;
+        } else if (!word.empty()) {
+            words.push_back(std::move(word));
+            word.clear();
+        }
+    }
+    if (!word.empty())
+        words.push_back(std::move(word));
+
+    std::vector<std::string> halves;
+    for (const auto& w : words) {
+        if (w.size() == 16) {
+            halves.push_back(w.substr(0, 8));
+            halves.push_back(w.substr(8));
+        } else {
+            // Invalid lengths are kept, so that the Gateway parser logs them as invalid lines.
+            halves.push_back(w);
+        }
+    }
+
+    std::string result;
+    for (std::size_t i = 0; i < halves.size(); i += 2) {
+        result += halves[i];
+        if (i + 1 < halves.size())
+            result += " " + halves[i + 1];
+        result += "\n";
+    }
+    return result;
+}
+
+/// Adds the frontend cheats the cheat engine does not have. Loading a game replaces the engine's
+/// list with the cheats file of the title, so cheats set before the load are added again here.
+static void add_libretro_cheats() {
+    auto& engine = Core::System::GetInstance().CheatEngine();
+    for (const auto& [index, cheat] : libretro_cheats) {
+        if (!find_cheat(cheat)) {
+            auto copy = cheat;
+            engine.AddCheat(std::move(copy));
+        }
+    }
+}
+
+void retro_cheat_reset() {
+    auto& engine = Core::System::GetInstance().CheatEngine();
+    for (const auto& [index, cheat] : libretro_cheats) {
+        if (const auto pos = find_cheat(cheat))
+            engine.RemoveCheat(*pos);
+    }
+    libretro_cheats.clear();
+}
+
+void retro_cheat_set(unsigned index, bool enabled, const char* code) {
+    if (code == nullptr)
+        return;
+
+    auto cheat = std::make_shared<Cheats::GatewayCheat>(fmt::format("libretro {}", index),
+                                                        to_gateway_code(code), "");
+    cheat->SetEnabled(enabled);
+    LOG_INFO(Frontend, "Cheat {} set ({})", index, enabled ? "enabled" : "disabled");
+
+    auto& engine = Core::System::GetInstance().CheatEngine();
+    const auto it = libretro_cheats.find(index);
+    if (it != libretro_cheats.end()) {
+        if (const auto pos = find_cheat(it->second)) {
+            engine.UpdateCheat(*pos, cheat);
+            it->second = std::move(cheat);
+            return;
+        }
+    }
+    libretro_cheats[index] = cheat;
+    engine.AddCheat(std::move(cheat));
+}
