@@ -2,6 +2,8 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <algorithm>
+#include <cctype>
 #include <boost/hana/string.hpp>
 
 #include "citra_libretro/core_settings.h"
@@ -257,7 +259,7 @@ static constexpr retro_core_option_v2_definition option_definitions[] = {
             { "Simplified Chinese", "Simplified Chinese" },
             { nullptr, nullptr }
         },
-        "english"
+        "English"
     },
 
     // Audio Category
@@ -875,28 +877,33 @@ static int GetRegionValue(const std::string& name) {
     return -1; // Auto
 }
 
-static Service::CFG::SystemLanguage GetLanguageValue(const std::string& name) {
-    if (name == "Japanese")
+static Service::CFG::SystemLanguage GetLanguageValue(const std::string& value) {
+    // Case-insensitive, so "German", "german" and "GERMAN" all work (frontends and older
+    // configs may hand over a different case than the option list shows).
+    std::string name = value;
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (name == "japanese")
         return Service::CFG::LANGUAGE_JP;
-    if (name == "French")
+    if (name == "french")
         return Service::CFG::LANGUAGE_FR;
-    if (name == "Spanish")
+    if (name == "spanish")
         return Service::CFG::LANGUAGE_ES;
-    if (name == "German")
+    if (name == "german")
         return Service::CFG::LANGUAGE_DE;
-    if (name == "Italian")
+    if (name == "italian")
         return Service::CFG::LANGUAGE_IT;
-    if (name == "Dutch")
+    if (name == "dutch")
         return Service::CFG::LANGUAGE_NL;
-    if (name == "Portuguese")
+    if (name == "portuguese")
         return Service::CFG::LANGUAGE_PT;
-    if (name == "Russian")
+    if (name == "russian")
         return Service::CFG::LANGUAGE_RU;
-    if (name == "Korean")
+    if (name == "korean")
         return Service::CFG::LANGUAGE_KO;
-    if (name == "Traditional Chinese")
+    if (name == "traditional chinese")
         return Service::CFG::LANGUAGE_TW;
-    if (name == "Simplified Chinese")
+    if (name == "simplified chinese")
         return Service::CFG::LANGUAGE_ZH;
     return Service::CFG::LANGUAGE_EN; // English default
 }

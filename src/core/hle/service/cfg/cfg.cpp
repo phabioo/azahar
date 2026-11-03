@@ -1060,6 +1060,15 @@ Module::Module(Core::System& system_) : system(system_) {
         SetEULAVersion(default_version);
         UpdateConfigNANDSavegame();
     }
+#ifdef HAVE_LIBRETRO
+    // The language chosen in the core options must win over the value persisted in the config
+    // savegame, and must not depend on the game asking for the region first (that path is only
+    // taken with automatic region selection). Apply and persist it at every boot.
+    if (GetRawSystemLanguage() != LibRetro::settings.language_value) {
+        SetSystemLanguage(LibRetro::settings.language_value);
+        UpdateConfigNANDSavegame();
+    }
+#endif
 }
 
 Module::~Module() = default;

@@ -6,6 +6,7 @@ This fork builds the Azahar libretro core for [Uzume](https://github.com/phabioo
 
 - **Memory map follows the game** (`src/citra_libretro/citra_libretro.cpp`): the core sent `RETRO_ENVIRONMENT_SET_MEMORY_MAPS` once at load, before the game maps its heap, so frontends saw only VRAM. The core now keeps the map tied to the application process, sends it again after a frame when the exposed VMAs changed, and splits VMAs that are not naturally aligned powers of two instead of skipping them. Needed by the SoulLink Core plugin, which reads game memory. Reported upstream as an issue (no code, per Azahar's `AI-POLICY.md`).
 - **Cheats from the frontend** (same file): `retro_cheat_set` and `retro_cheat_reset` were empty. They now hand Gateway codes to Azahar's own cheat engine (`src/core/cheats`). Lines may be separated by `+`, newlines or spaces; a line may be one 16-digit token. Cheats from the cheats folder of the title stay as they are. Needed by the Uzume cheats plugin.
+- **System language from the core option** (`src/core/hle/service/cfg/cfg.cpp`, `src/citra_libretro/core_settings.cpp`): the "3DS System Language" option only reached the config block when a game asked for the region with automatic region selection, and was never saved, so the language stored in `sysdata/config` won. The option is now applied and saved at every boot; its default is the listed value `English` and the name is matched case-insensitively.
 
 ## Branches and builds
 
